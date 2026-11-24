@@ -2181,6 +2181,8 @@ function ChannelWorkspace({
     return {
       title: panel.title,
       content,
+      openingTrigger:
+        navigation && !navigation.traversal ? panelTrigger.current : null,
       openAsTab: () => {
         const entry = navigator?.snapshot().entry;
         if (entry?.target.kind !== "conversation") return;
