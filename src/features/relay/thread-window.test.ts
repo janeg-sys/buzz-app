@@ -1951,9 +1951,10 @@ it("settles session recovery when a read view with a quiet failure passes its me
     await vi.advanceTimersByTimeAsync(7000);
     expect(recovery.snapshot().recovering).toBe(true);
     // Live replies alone pass the limit: no read is running to report it.
+    const chunk = "x".repeat(4 << 20);
     h.traffic.receive(
-      Array.from({ length: 5 }, (_, n) =>
-        message(author, channel, "x".repeat(1 << 20), 1000 + n, [
+      Array.from({ length: 9 }, (_, n) =>
+        message(author, channel, chunk, 1000 + n, [
           ["e", root.id, "", "reply"],
         ]),
       ),
@@ -1975,4 +1976,290 @@ it("settles session recovery when a read view with a quiet failure passes its me
     vi.restoreAllMocks();
     view.dispose();
   }
+});
+
+it("caps automatic unread paging at 10 windows while allowing manual scrollback past 2,000 replies to exhaustion", async () => {
+  const rows = Array.from({ length: 2050 }, (_, n) => filler(n));
+  const h = await setup(serving(rows));
+  await h.view.refresh();
+  expect(h.view.snapshot()).toMatchObject({
+    status: "ready",
+    canLoadMore: true,
+    canAutoLoadMore: true,
+    limited: false,
+  });
+  expect(h.view.snapshot().replies).toHaveLength(10);
+
+  // Automatic unread-frontier paging stops at 10 windows (460 replies) while
+  // keeping manual continuation open.
+  await h.view.loadMore(() => 0);
+  expect(h.view.snapshot()).toMatchObject({
+    status: "ready",
+    canLoadMore: true,
+    canAutoLoadMore: false,
+    limited: false,
+  });
+  expect(h.view.snapshot().replies).toHaveLength(460);
+  expect(windows(h.requests)).toHaveLength(10);
+
+  // Another automatic frontier request is a no-op once the allowance is spent.
+  const afterAuto = h.requests.length;
+  await h.view.loadMore(() => 0);
+  expect(h.requests).toHaveLength(afterAuto);
+
+  // Manual scrollback continues page by page past 2,000 replies to exhaustion.
+  while (h.view.snapshot().canLoadMore) await h.view.loadMore();
+  expect(h.view.snapshot()).toMatchObject({
+    status: "ready",
+    canLoadMore: false,
+    canAutoLoadMore: false,
+    limited: false,
+  });
+  expect(h.view.snapshot().replies).toHaveLength(2050);
+  expect(h.view.snapshot().replies[0]?.id).toBe(rows[0]?.id);
+  expect(windows(h.requests)).toHaveLength(42);
+}, 30_000);
+
+it("caps discontinuous reconnect refresh of a deep thread at 10 windows and refreshes edited older replies on re-scroll", async () => {
+  const rows = Array.from({ length: 560 }, (_, n) => filler(n));
+  const oldest = rows[0];
+  assert.exists(oldest);
+  let edit: RelayEvent | undefined;
+  const serve = serving(rows);
+  const h = await setup((f) => {
+    const response = serve(f);
+    return edit && response.some((event) => event.id === oldest.id)
+      ? [...response, edit]
+      : response;
+  });
+  await h.view.refresh();
+  while (h.view.snapshot().canLoadMore) await h.view.loadMore();
+  expect(h.view.snapshot().replies).toHaveLength(560);
+  expect(h.view.snapshot().canLoadMore).toBe(false);
+
+  // While disconnected, the oldest reply on page 12 is edited.
+  edit = signed(author, {
+    kind: 40003,
+    created_at: 9999,
+    content: "edited offline",
+    tags: [["e", oldest.id]],
+  });
+  const beforeReconnect = h.requests.length;
+  h.traffic.established(channel);
+  await vi.waitFor(() => {
+    expect(h.view.snapshot()).toMatchObject({
+      status: "ready",
+      canLoadMore: true,
+      canAutoLoadMore: false,
+      limited: false,
+    });
+    expect(h.view.snapshot().replies).toHaveLength(460);
+  });
+  // Bounded at 10 windows (not 12), and pages 11-12 were retired so the cursor
+  // matches the displayed prefix.
+  expect(windows(h.requests.slice(beforeReconnect))).toHaveLength(10);
+
+  // Scrolling back through pages 11-12 fetches the offline edit cleanly.
+  while (h.view.snapshot().canLoadMore) await h.view.loadMore();
+  expect(h.view.snapshot().replies).toHaveLength(560);
+  expect(h.view.snapshot().replies[0]?.content).toBe("edited offline");
+});
+
+it("caps background missing-parent seeks at 10 windows, does not restart them on refresh, and still allows manual scrollback to find the parent", async () => {
+  const base = Array.from({ length: 559 }, (_, n) => filler(n));
+  const parent = base[0];
+  assert.exists(parent);
+  const child = nested("child", 2000, parent.id);
+  const rows = [...base, child];
+  const h = await setup(serving(rows));
+  const view = h.session.thread(channel, root.id, { reading: true });
+  try {
+    await view.refresh();
+    await vi.waitFor(() => {
+      expect(view.snapshot().replies).toHaveLength(460);
+      expect(view.snapshot().seeking).toBeUndefined();
+    });
+    expect(view.snapshot()).toMatchObject({
+      status: "ready",
+      canLoadMore: true,
+      canAutoLoadMore: false,
+      limited: false,
+    });
+    expect(windows(h.requests)).toHaveLength(10);
+
+    // Refreshing does not restart an already-spent background seek.
+    const beforeRefresh = h.requests.length;
+    await view.refresh();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(windows(h.requests.slice(beforeRefresh))).toHaveLength(10);
+    expect(view.snapshot().seeking).toBeUndefined();
+
+    // Manual scrollback still reaches the parent on page 12.
+    while (view.snapshot().canLoadMore) await view.loadMore();
+    expect(view.snapshot().replies).toHaveLength(560);
+    expect(view.snapshot().replies[0]?.id).toBe(parent.id);
+  } finally {
+    view.dispose();
+  }
+});
+
+it("preserves a concurrently retargeted deep reply and live kind-40008 diff replies across a capped deep refresh", async () => {
+  const rows = Array.from({ length: 560 }, (_, n) => filler(n));
+  const deepReply = rows[50]; // page 11
+  assert.exists(deepReply);
+  const diffReply = signed(author, {
+    kind: 40008,
+    created_at: 9000,
+    content: "diff reply",
+    tags: [
+      ["h", channel],
+      ["e", root.id, "", "reply"],
+    ],
+  });
+  let holdRefresh: (() => void) | undefined;
+  let heldOnce = false;
+  const serve = serving(rows);
+  const h = await setup(async (f) => {
+    if (f.ids?.includes(deepReply.id)) return [deepReply];
+    if (holdRefresh && f.thread_window && f.until === undefined && !heldOnce) {
+      heldOnce = true;
+      await new Promise<void>((resolve) => {
+        const release = holdRefresh;
+        holdRefresh = () => {
+          release?.();
+          resolve();
+        };
+      });
+    }
+    return serve(f);
+  });
+  await h.view.refresh();
+  while (h.view.snapshot().canLoadMore) await h.view.loadMore();
+  h.traffic.receive([diffReply]);
+  expect(h.view.snapshot().replies.some((r) => r.id === diffReply.id)).toBe(
+    true,
+  );
+
+  // Start a capped deep refresh, hold it on window 1, and retarget to page 11 mid-flight.
+  let releaseWindow!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    releaseWindow = resolve;
+  });
+  holdRefresh = releaseWindow;
+  const refreshing = h.view.refresh();
+  await vi.waitFor(() => expect(heldOnce).toBe(true));
+  const outcome = await h.view.retarget(
+    deepReply.id,
+    new AbortController().signal,
+  );
+  expect(outcome).toBe("selected");
+  expect(h.view.snapshot().targetStatus).toBe("ready");
+  holdRefresh();
+  await waiting;
+  await refreshing;
+
+  // Both the newly selected deep reply and the live kind-40008 diff reply survive.
+  expect(h.view.snapshot().target?.id).toBe(deepReply.id);
+  expect(h.view.snapshot().targetStatus).toBe("ready");
+  expect(h.view.snapshot().replies.some((r) => r.id === deepReply.id)).toBe(
+    true,
+  );
+  expect(h.view.snapshot().replies.some((r) => r.id === diffReply.id)).toBe(
+    true,
+  );
+  expect(h.view.snapshot().canLoadMore).toBe(true);
+});
+
+it("keeps drop-time held IDs free of replayed replies when the stream drops during a capped deep refresh", async () => {
+  const initial = Array.from({ length: 560 }, (_, n) => filler(n));
+  // 500 newer replies that arrive after disconnect, exceeding a 10-window gap.
+  const burst = Array.from({ length: 500 }, (_, n) =>
+    message(author, channel, `burst ${n}`, 5000 + n, [
+      ["e", root.id, "", "reply"],
+    ]),
+  );
+  let phase: "initial" | "burst" = "initial";
+  let gate: (() => void) | undefined;
+  let gated = false;
+  const serveInitial = serving(initial);
+  const serveBurst = serving([...initial, ...burst]);
+  const h = await setup(async (f) => {
+    if (gate && f.thread_window && f.until === undefined && !gated) {
+      gated = true;
+      await new Promise<void>((resolve) => {
+        gate = resolve;
+      });
+    }
+    return phase === "initial" ? serveInitial(f) : serveBurst(f);
+  });
+  await h.view.refresh();
+  while (h.view.snapshot().canLoadMore) await h.view.loadMore();
+  expect(h.view.snapshot().replies).toHaveLength(560);
+  h.traffic.state({ status: "connected", routes: [] });
+
+  // Start a deep refresh, drop the stream mid-flight, deliver a replayed burst
+  // reply, and trigger establishment before the first refresh settles.
+  gate = () => {};
+  const firstRefresh = h.view.refresh();
+  await vi.waitFor(() => expect(gated).toBe(true));
+  h.traffic.state({ status: "retrying", routes: [] });
+  phase = "burst";
+  h.traffic.state({ status: "connected", routes: [] });
+  const replayed = burst.at(-1);
+  assert.exists(replayed);
+  h.traffic.receive([replayed]);
+  h.traffic.established(channel);
+  gate();
+  await firstRefresh;
+
+  // The queued establishment refresh must not treat `replayed` as closing the
+  // gap back to pre-drop replies: all pre-drop replies (past the 10-window
+  // burst) are dropped instead of sitting beneath a silent gap.
+  await vi.waitFor(() => {
+    const ids = new Set(h.view.snapshot().replies.map((r) => r.id));
+    expect(ids.has(replayed.id)).toBe(true);
+    expect(ids.has(initial.at(-1)?.id ?? "")).toBe(false);
+  });
+});
+
+it("preserves queued manual scrollback past page 10 while dropping queued automatic continuation at the cap", async () => {
+  const rows = Array.from({ length: 560 }, (_, n) => filler(n));
+  let releasePage10: (() => void) | undefined;
+  let heldPage10 = false;
+  let windowCount = 0;
+  const serve = serving(rows);
+  const h = await setup(async (f) => {
+    if (f.thread_window) {
+      windowCount++;
+      if (windowCount === 10 && !heldPage10) {
+        heldPage10 = true;
+        await new Promise<void>((resolve) => {
+          releasePage10 = resolve;
+        });
+      }
+    }
+    return serve(f);
+  });
+  await h.view.refresh();
+  for (let i = 2; i <= 9; i++) await h.view.loadMore();
+  expect(h.view.snapshot().replies).toHaveLength(410);
+
+  // Page 10 is in flight; queue an automatic request and a manual scrollback.
+  const page10 = h.view.loadMore();
+  await vi.waitFor(() => expect(heldPage10).toBe(true));
+  void h.view.loadMore({ automatic: true });
+  void h.view.loadMore();
+  void h.view.loadMore(() => 0);
+  releasePage10?.();
+  await page10;
+
+  // Manual scrollback survives the automatic requests and loads page 11 (510 rows).
+  await vi.waitFor(() => expect(h.view.snapshot().replies).toHaveLength(510));
+  expect(windows(h.requests)).toHaveLength(11);
+
+  // Automatic calls at page >= 10 issue no further reads.
+  const before = h.requests.length;
+  await h.view.loadMore({ automatic: true });
+  await h.view.loadMore(() => 0);
+  expect(h.requests).toHaveLength(before);
 });

@@ -1065,9 +1065,15 @@ it("drops stale root content when the finite root is missing and exposes explici
 
 it("explicitly limits oversized evidence rather than evicting aux and resurrecting deleted rows", async () => {
   const h = seeded();
+  const chunk = "x".repeat(7 * 1024 * 1024);
   const loading = h.view.refresh();
-  h.next().respond([root, reply("x".repeat(4 * 1024 * 1024), 2)]);
+  h.next().respond([root, reply(chunk, 2)]);
   await loading;
+  for (let page = 2; page <= 5; page++) {
+    const more = h.view.loadMore();
+    h.next().respond([root, reply(chunk, page + 1)]);
+    await more;
+  }
   expect(h.view.snapshot()).toMatchObject({
     status: "error",
     limited: true,
@@ -1124,6 +1130,7 @@ it.each(["live", "read"])(
       canAccess: () => true,
       visible: (events) => events,
       notify: (listener) => listener(),
+      maxEvents: 2000,
     });
     try {
       if (source === "read") await thread.view.refresh();
@@ -1210,14 +1217,16 @@ it("trips the live byte limit at exactly the whole-thread serialised size", asyn
   const loading = h.view.refresh();
   h.next().respond([root, first]);
   await loading;
-  const limit = 4 * 1024 * 1024;
-  const sized = (length: number) => reply("x".repeat(length), 11);
-  const fits = sized(limit - byteSize([root, first, sized(0)]));
-  expect(byteSize([root, first, fits])).toBe(limit);
-  h.traffic.receive([fits]);
+  const limit = 32 * 1024 * 1024;
+  const chunk = "x".repeat(4 * 1024 * 1024);
+  const filler = Array.from({ length: 7 }, (_, i) => reply(chunk, 11 + i));
+  const sized = (length: number) => reply("x".repeat(length), 20);
+  const fits = sized(limit - byteSize([root, first, ...filler, sized(0)]));
+  expect(byteSize([root, first, ...filler, fits])).toBe(limit);
+  h.traffic.receive([...filler, fits]);
   expect(h.view.snapshot()).toMatchObject({ status: "ready", limited: false });
-  expect(h.view.snapshot().replies).toHaveLength(2);
-  h.traffic.receive([reply("y", 12)]);
+  expect(h.view.snapshot().replies).toHaveLength(9);
+  h.traffic.receive([reply("y", 21)]);
   expect(h.view.snapshot()).toMatchObject({
     status: "error",
     limited: true,

@@ -871,7 +871,11 @@ function ThreadMessages({
       0,
       ...snapshot.replies.map((reply) => reply.createdAt),
     ),
-    complete: snapshot.status === "ready" && !snapshot.canLoadMore,
+    complete:
+      snapshot.status === "ready" &&
+      (snapshot.direction === "older"
+        ? !snapshot.resumed
+        : !snapshot.canLoadMore),
   });
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [newMessageCount, setNewMessageCount] = useState(0);
@@ -1207,6 +1211,7 @@ function ThreadMessages({
     const unreadOlder = (threadUnread?.observedCount ?? 0) > loadedUnread;
     const readThrough =
       since ?? session.unread.threadReadThrough(channelId, messageId);
+    const canAutoLoadMore = snapshot.canAutoLoadMore ?? snapshot.canLoadMore;
     if (
       known &&
       snapshot.direction === "older" &&
@@ -1216,11 +1221,11 @@ function ThreadMessages({
     ) {
       // Page to the frontier in one read, not one page per decision. Read
       // per page: a read synced mid-load can move it.
-      if (snapshot.canLoadMore)
+      if (canAutoLoadMore)
         void view.loadMore(
           () => since ?? session.unread.threadReadThrough(channelId, messageId),
         );
-      // Past the page limit the first unread reply stays unknown.
+      // Past the automatic page limit the first unread reply stays unknown.
       else setBoundary({ ...boundary, id: null });
       return;
     }
@@ -1499,11 +1504,15 @@ function ThreadMessages({
       snapshot.status === "ready" &&
       snapshot.canLoadMore
     )
-      void view.loadMore();
+      void view.loadMore({ automatic: true });
   }, [view, snapshot]);
   useLayoutEffect(() => {
     const previous = previousReplies.current;
-    const complete = snapshot.status === "ready" && !snapshot.canLoadMore;
+    const complete =
+      snapshot.status === "ready" &&
+      (snapshot.direction === "older"
+        ? !snapshot.resumed
+        : !snapshot.canLoadMore);
     // Initial traversal has no baseline. Once complete, retain the last
     // observed replies through reconnect loading so recovery can reconcile them.
     if (!complete && !previous.complete) return;
@@ -1526,7 +1535,13 @@ function ThreadMessages({
       };
     if (arrivals > 0 && !follow.current)
       setNewMessageCount((count) => count + arrivals);
-  }, [snapshot.status, snapshot.canLoadMore, snapshot.replies]);
+  }, [
+    snapshot.status,
+    snapshot.direction,
+    snapshot.resumed,
+    snapshot.canLoadMore,
+    snapshot.replies,
+  ]);
   // biome-ignore lint/correctness/useExhaustiveDependencies: Rendered rows/profiles change scroll height; sending is explicit navigation intent.
   useLayoutEffect(() => {
     const element = scroller.current;
@@ -2304,7 +2319,10 @@ function ThreadMessages({
       snapshot.status !== "ready" ||
       !snapshot.canLoadMore ||
       element.scrollTop >
-        Math.max(80, (element.scrollHeight - element.clientHeight) * 0.2)
+        Math.max(
+          80,
+          Math.min((element.scrollHeight - element.clientHeight) * 0.2, 800),
+        )
     )
       return;
     olderDemand.current = false;

@@ -24,9 +24,13 @@ import { RESUME_READ_AGE } from "./live";
 const AUX = new Set([5, 7, 9005, 40003, 39005, 39006]);
 const PAGE_SIZE = 50;
 const INITIAL_WINDOW_SIZE = 10;
-const MAX_PAGES = 10;
-const MAX_EVENTS = 2000;
-const MAX_BYTES = 4 * 1024 * 1024;
+/** Page ceiling for automatic walks (legacy forward traversal, reconnect
+ * refresh/gap-fill, unread-frontier positioning, missing-parent seeks, and
+ * eager consumers such as media review). Manual strict scrollback is bounded
+ * only by exhaustion and the view's memory budget. */
+const AUTO_MAX_PAGES = 10;
+const MAX_EVENTS = 25_000;
+const MAX_BYTES = 32 * 1024 * 1024;
 /** The relay's `thread_window` row allowlist excludes legacy diffs (kind 40008). */
 const STRICT_WINDOW_KINDS = [9, 40002];
 const inChannel = (event: EventData, channelId: string) =>
@@ -42,6 +46,8 @@ export type ThreadSnapshot = Readonly<{
   error: string | undefined;
   /** Continuation is possible, not a claim about total thread size or exhaustion. */
   canLoadMore: boolean;
+  /** Automatic paging is still within its page allowance; manual scrollback uses `canLoadMore`. */
+  canAutoLoadMore?: boolean | undefined;
   limited: boolean;
   /** Older pages are demand-loaded; forward is the legacy bounded walk. */
   direction?: "older" | "forward";
@@ -66,6 +72,7 @@ export type ThreadResume = Readonly<{
   replies: readonly ChannelMessage[];
   direction: "older" | "forward";
   canLoadMore: boolean;
+  canAutoLoadMore?: boolean | undefined;
   limited: boolean;
 }>;
 /** Every ID a deletion among these events names, valid or not. */
@@ -105,8 +112,10 @@ export type ThreadView = {
     sourceThreadId?: string | undefined;
   }): Promise<void>;
   /** Reads older replies; with `through`, keeps paging in this one read until
-   * a reply at or before the time it returns is loaded. */
-  loadMore(through?: () => number): Promise<void>;
+   * a reply at or before the time it returns is loaded, up to the automatic
+   * page allowance. Pass `{ automatic: true }` for eager callers without a
+   * manual gesture (such as media review). */
+  loadMore(through?: (() => number) | { automatic: true }): Promise<void>;
   /** Change exact selection only when verified ancestry belongs to this thread. */
   retarget(messageId: string, signal: AbortSignal): Promise<ThreadRetarget>;
   dispose(): void;
@@ -149,6 +158,7 @@ export function createThreadView({
   dropped: openedDropped = false,
   now = Date.now,
   recover,
+  maxEvents = MAX_EVENTS,
 }: {
   channelId: string;
   messageId: string;
@@ -191,6 +201,8 @@ export function createThreadView({
    * retry, and older pages are read for a loaded reply's missing parent.
    * Called when `recovery()` may have changed. */
   recover?: (() => void) | undefined;
+  /** Per-view retained event count ceiling; defaults to the production budget. */
+  maxEvents?: number | undefined;
 }) {
   // Only a view with `recover` is a session recovery source. The existing
   // selection/page controllers still own cancellation and stale-result fencing.
@@ -231,6 +243,10 @@ export function createThreadView({
     : "legacy";
   let cursor: ThreadCursor | undefined;
   let pages = 0;
+  /** Committed background missing-parent seek pages for this view; not reset by refresh. */
+  let seekPages = 0;
+  const canAutoPage = (state: ThreadSnapshot) =>
+    state.canAutoLoadMore ?? state.canLoadMore;
   const isReply = (event: RelayEvent) =>
     !AUX.has(event.kind) &&
     event.id !== rootId &&
@@ -266,9 +282,11 @@ export function createThreadView({
   let controller: AbortController | undefined;
   /** A refresh requested while a read runs; the stream's return carries over. */
   let again: false | "refresh" | "established" = false;
-  /** An older page asked for while a read runs or a quiet failure waits, read
-   * after it: `true`, or the frontier to read to. */
-  let older: (() => number) | boolean = false;
+  /** Queued demand while a read runs or a quiet failure waits. Manual scrollback
+   * is tracked separately so an automatic frontier/media request cannot overwrite
+   * it and drop it at `AUTO_MAX_PAGES`. */
+  let olderManual = false;
+  let olderAuto: (() => number) | true | undefined;
   /** The read that failed transiently, which session recovery retries. */
   let failed: "refresh" | "older" | undefined;
   /** The read running is one for a missing parent, or `null` once the relay
@@ -283,6 +301,7 @@ export function createThreadView({
     replies: Object.freeze([]),
     error: undefined,
     canLoadMore: false,
+    canAutoLoadMore: false,
     limited: false,
   });
   const listeners = new Set<() => void>();
@@ -353,8 +372,9 @@ export function createThreadView({
     const known = new Set(next.replies.map((row) => row.id));
     const seeking =
       seek !== null &&
+      seekPages < AUTO_MAX_PAGES - 1 &&
       (next.direction
-        ? next.direction === "older" && next.canLoadMore
+        ? next.direction === "older" && canAutoPage(next)
         : next.status === "idle" || next.status === "loading") &&
       next.replies.some(
         (row) =>
@@ -515,7 +535,7 @@ export function createThreadView({
     });
   }
   function retain(events: readonly RelayEvent[], commit = true) {
-    if (events.length > MAX_EVENTS || listByteSize(events) > MAX_BYTES) {
+    if (events.length > maxEvents || listByteSize(events) > MAX_BYTES) {
       // Never silently evict a deletion/ancestor then display resurrected content.
       controller?.abort();
       selectionController?.abort();
@@ -526,8 +546,10 @@ export function createThreadView({
       rootId = undefined;
       cursor = undefined;
       pages = 0;
+      seekPages = 0;
       again = false;
-      older = false;
+      olderManual = false;
+      olderAuto = undefined;
       failed = undefined;
       shown = undefined;
       if (exact) targetStatus = "error";
@@ -535,6 +557,7 @@ export function createThreadView({
         status: "error",
         limited: true,
         canLoadMore: false,
+        canAutoLoadMore: false,
         error:
           "Thread view exceeded its memory limit. Refresh to read from the beginning.",
       });
@@ -563,10 +586,16 @@ export function createThreadView({
    * reply shown without it. Each page that lands advances again. */
   function advance() {
     if (disposed || controller || failed) return;
-    if (older) {
-      const through = older === true ? undefined : older;
-      older = false;
-      void run(false, false, through);
+    if (olderManual) {
+      const through = typeof olderAuto === "function" ? olderAuto : undefined;
+      olderManual = false;
+      olderAuto = undefined;
+      void run(false, false, through, false, false);
+    } else if (olderAuto) {
+      const next = olderAuto;
+      olderAuto = undefined;
+      if (pages < AUTO_MAX_PAGES)
+        void run(false, false, next === true ? undefined : next, false, true);
     } else if (
       recover &&
       // A resumed view has no page of its own to read on from yet.
@@ -603,6 +632,7 @@ export function createThreadView({
       status: "ready",
       direction: resume.direction,
       canLoadMore: resume.canLoadMore,
+      canAutoLoadMore: resume.canAutoLoadMore ?? resume.canLoadMore,
       limited: resume.limited,
     });
   }
@@ -616,7 +646,8 @@ export function createThreadView({
     selectionStaged = [];
     controller = undefined;
     again = false;
-    older = false;
+    olderManual = false;
+    olderAuto = undefined;
     failed = undefined;
     staged = [];
     shown = undefined;
@@ -627,12 +658,14 @@ export function createThreadView({
       rootId = undefined;
       cursor = undefined;
       pages = 0;
+      seekPages = 0;
       held = undefined;
     } else remote = visible(remote);
     remoteIds = new Set(remote.map((event) => event.id));
     publish({
       status: "idle",
       canLoadMore: false,
+      canAutoLoadMore: false,
       limited: false,
       error: canAccess()
         ? "Thread read interrupted. Refresh to continue."
@@ -815,9 +848,13 @@ export function createThreadView({
 
   /** Demand for an older page. It waits out a quiet failure, whose retry is
    * session recovery's. */
-  async function more(through?: () => number) {
-    if (!failed) return run(false, false, through);
-    older = through ?? (older || true);
+  async function more(request?: (() => number) | { automatic: true }) {
+    const automatic = request !== undefined;
+    const through = typeof request === "function" ? request : undefined;
+    if (automatic && pages >= AUTO_MAX_PAGES) return;
+    if (!failed) return run(false, false, through, false, automatic);
+    if (automatic) olderAuto = through ?? (olderAuto || true);
+    else olderManual = true;
     // The wait shows as the read it is for.
     publishStatus({ status: "loading", readKind: "older" });
   }
@@ -827,6 +864,8 @@ export function createThreadView({
     through?: () => number,
     /** For a missing parent, not a person: see `advance`. */
     sought = false,
+    /** Automatic continuation (unread frontier or eager media review), capped at `AUTO_MAX_PAGES`. */
+    automatic = through !== undefined,
   ) {
     if (disposed) return;
     // A read someone asked for takes the place of one for a missing parent.
@@ -834,14 +873,22 @@ export function createThreadView({
     else if (controller) {
       if (established) again = "established";
       else if (replace) again ||= "refresh";
-      else older = through ?? (older || true);
+      else if (automatic) olderAuto = through ?? (olderAuto || true);
+      else olderManual = true;
       return;
     }
     if (!canAccess()) {
       purge();
       return;
     }
-    if (!replace && (!snapshot.canLoadMore || snapshot.limited)) return;
+    if (
+      !replace &&
+      (!snapshot.canLoadMore ||
+        snapshot.limited ||
+        (automatic && pages >= AUTO_MAX_PAGES) ||
+        (sought && (!canAutoPage(snapshot) || seekPages >= AUTO_MAX_PAGES - 1)))
+    )
+      return;
     // A retry stays as quiet as the failure it follows.
     const background =
       established || sought || (replace && (!!shown || !!failed));
@@ -860,7 +907,10 @@ export function createThreadView({
     if (established) dropped = false;
     const active = () =>
       !disposed && !owned.signal.aborted && controller === owned;
-    const targetPages = replace ? Math.max(1, pages) : 1;
+    const priorPages = pages;
+    const targetPages = replace
+      ? Math.max(1, Math.min(pages, AUTO_MAX_PAGES))
+      : 1;
     let nextCursor = replace ? undefined : cursor;
     let nextPages = replace ? 0 : pages;
     let fetched: readonly RelayEvent[] = [];
@@ -876,7 +926,10 @@ export function createThreadView({
         error: undefined,
         // A quiet retry leaves a page asked for behind it showing as that
         // page.
-        readKind: replace && !(background && older) ? "refresh" : "older",
+        readKind:
+          replace && !(background && (olderManual || olderAuto))
+            ? "refresh"
+            : "older",
       });
     try {
       if (exact && replace) {
@@ -891,7 +944,11 @@ export function createThreadView({
         if (!active()) return;
         if (anchorResult !== "selected" && revision === selectionRevision) {
           targetStatus = "unavailable";
-          publish({ status: "ready", canLoadMore: false });
+          publish({
+            status: "ready",
+            canLoadMore: false,
+            canAutoLoadMore: false,
+          });
           return;
         }
         if (revision === selectionRevision) {
@@ -902,7 +959,11 @@ export function createThreadView({
             targetStatus = "ready";
             publish();
             if (snapshot.targetStatus !== "ready") {
-              publish({ status: "ready", canLoadMore: false });
+              publish({
+                status: "ready",
+                canLoadMore: false,
+                canAutoLoadMore: false,
+              });
               return;
             }
           }
@@ -984,7 +1045,7 @@ export function createThreadView({
           rootUnavailable = true;
           cursor = undefined;
           pages = 0;
-          publish({ canLoadMore: false });
+          publish({ canLoadMore: false, canAutoLoadMore: false });
           throw new Error("The original thread message is unavailable.");
         }
         if (!retain(union(remote, related(root)))) return;
@@ -992,7 +1053,8 @@ export function createThreadView({
       // A strict refresh re-reads from the newest end. Live replay covers
       // minutes, not a long disconnect, so keep paging until a reply kept
       // across the drop is reached.
-      const kept = replace ? (held ?? unverified()) : new Set<string>();
+      const preRefresh = replace ? unverified() : new Set<string>();
+      const kept = replace ? (held ?? preRefresh) : new Set<string>();
       let reached = !kept.size;
       let more = false;
       // Where the loop passed the range the reader had, so a fill that never
@@ -1002,8 +1064,10 @@ export function createThreadView({
       for (
         let page = 0;
         page < targetPages ||
-        (mode === "older" && !reached && page < MAX_PAGES) ||
-        (through !== undefined && oldest > through() && nextPages < MAX_PAGES);
+        (mode === "older" && !reached && page < AUTO_MAX_PAGES) ||
+        (through !== undefined &&
+          oldest > through() &&
+          nextPages < AUTO_MAX_PAGES);
         page++
       ) {
         let response: readonly RelayEvent[];
@@ -1072,7 +1136,7 @@ export function createThreadView({
           rootUnavailable = true;
           cursor = undefined;
           pages = 0;
-          publish({ canLoadMore: false });
+          publish({ canLoadMore: false, canAutoLoadMore: false });
           throw new Error("The original thread message is unavailable.");
         }
         // Count traversal rows before presentation filtering. The bridge may return
@@ -1093,7 +1157,7 @@ export function createThreadView({
           : (replies.at(-1) ?? nextCursor);
         nextPages++;
         fetched = union(fetched, related(events));
-        if (fetched.length > MAX_EVENTS || listByteSize(fetched) > MAX_BYTES) {
+        if (fetched.length > maxEvents || listByteSize(fetched) > MAX_BYTES) {
           retain(fetched);
           return;
         }
@@ -1107,6 +1171,7 @@ export function createThreadView({
           if (!retain(union(remote, fetched))) return;
           cursor = nextCursor;
           pages = nextPages;
+          if (sought) seekPages++;
         }
         if (!more) break;
       }
@@ -1116,30 +1181,70 @@ export function createThreadView({
       // the re-read never reached sit past a gap it cannot show; those go. The
       // pages read past the reader's range stay as evidence, but the range
       // settles back on the reader's: as the retained range, every later
-      // refresh would re-read them all.
+      // refresh would re-read them all. When a deep view's refresh is capped at
+      // AUTO_MAX_PAGES and older history remains, retire unrefreshed older
+      // strict-window replies (preserving active selections, their retained
+      // ancestry, and legacy kinds that strict windows cannot re-fetch) so the
+      // cursor and displayed range stay consistent.
       const unreached = mode === "older" && !reached && more;
+      const capped =
+        replace && mode === "older" && priorPages > AUTO_MAX_PAGES && more;
       if (unreached && range) {
         nextCursor = range.cursor;
         nextPages = targetPages;
       }
-      if (
-        !retain(
-          union(
-            unreached ? remote.filter((event) => !kept.has(event.id)) : remote,
-            fetched,
-          ),
-        )
-      )
-        return;
+      let base = remote;
+      if (unreached || capped) {
+        const fetchedIds = capped
+          ? new Set(fetched.map((event) => event.id))
+          : undefined;
+        // Computed at commit time so a concurrent retarget() or deep subthread
+        // keeps its selected row and retained ancestor chain intact.
+        const protectedIds = capped ? new Set<string>() : undefined;
+        if (protectedIds) {
+          const seeds = [
+            ...(subthreadId ? [subthreadId] : []),
+            ...(exact ? [messageId] : []),
+            ...(branchSelection ? [branchSelection.id] : []),
+          ];
+          if (seeds.length) {
+            const byId = new Map(remote.map((event) => [event.id, event]));
+            for (const seedId of seeds) {
+              let current: string | undefined = seedId;
+              while (current && !protectedIds.has(current)) {
+                protectedIds.add(current);
+                const currentEvent = byId.get(current);
+                if (!currentEvent) break;
+                const parent = threadReference(currentEvent)?.parentId;
+                if (!parent || parent === rootId) break;
+                current = parent;
+              }
+            }
+          }
+        }
+        base = remote.filter(
+          (event) =>
+            (!unreached || !kept.has(event.id)) &&
+            (!capped ||
+              !preRefresh.has(event.id) ||
+              !STRICT_WINDOW_KINDS.includes(event.kind) ||
+              (protectedIds?.has(event.id) ?? false) ||
+              (fetchedIds?.has(event.id) ?? false)),
+        );
+      }
+      if (!retain(union(base, fetched))) return;
       rootUnavailable = false;
       cursor = nextCursor;
       pages = nextPages;
       if (replace) readAt = startedAt;
       // While the stream is down (a drop mid-refresh ran stale() first) the
       // held replies stand; a view holding none, or a fill that gave them up,
-      // takes the replies now.
+      // takes the replies now. A capped refresh keeps only the surviving
+      // pre-drop IDs in `held`, never admitting newly replayed replies.
       if (replace && !dropped) held = undefined;
       else if (replace && (unreached || !held?.size)) held = unverified();
+      else if (replace && capped && held)
+        held = new Set([...held].filter((id) => remoteIds.has(id)));
       if (replace) shown = undefined;
       if (branchSelection?.revision === selectionRevision) {
         const result =
@@ -1150,13 +1255,15 @@ export function createThreadView({
         if (branchSelection.revision === selectionRevision)
           targetStatus = result === "selected" ? "ready" : "unavailable";
       }
+      const legacy = mode === "legacy";
       publish({
         status: "ready",
         error: undefined,
         readKind: undefined,
         direction: mode === "older" ? "older" : "forward",
-        canLoadMore: more && pages < MAX_PAGES,
-        limited: more && pages >= MAX_PAGES,
+        canLoadMore: more && (!legacy || pages < AUTO_MAX_PAGES),
+        canAutoLoadMore: more && pages < AUTO_MAX_PAGES,
+        limited: legacy && more && pages >= AUTO_MAX_PAGES,
       });
     } catch (error) {
       if (active()) {
@@ -1171,8 +1278,12 @@ export function createThreadView({
           failed = replace ? "refresh" : "older";
           // The page a person asked for is still wanted once this recovers,
           // to the frontier asked for last.
-          if (!replace && !sought && typeof older !== "function")
-            older = through ?? true;
+          if (!replace && !sought) {
+            if (automatic) {
+              if (typeof olderAuto !== "function")
+                olderAuto = through ?? (olderAuto || true);
+            } else olderManual = true;
+          }
           publishStatus({});
         } else if (sought && !rootUnavailable) {
           // Nobody asked for this read: its failure shows only as the parent
@@ -1182,7 +1293,8 @@ export function createThreadView({
         } else {
           // A failed repair stays visible with Retry; the page queued behind
           // it would clear that error.
-          older = false;
+          olderManual = false;
+          olderAuto = undefined;
           if (targetStatus === "loading") targetStatus = "error";
           // A failed refresh shows what is read, as a fresh view would.
           if (replace && shown) {
@@ -1230,8 +1342,15 @@ export function createThreadView({
      * outside the root's window. A retarget only to the root keeps its rows. */
     resume(): ThreadResume | "keep" | undefined {
       if (controller || shown || selectedReply || failed) return "keep";
-      const { status, root, replies, direction, canLoadMore, limited } =
-        snapshot;
+      const {
+        status,
+        root,
+        replies,
+        direction,
+        canLoadMore,
+        canAutoLoadMore,
+        limited,
+      } = snapshot;
       if (
         disposed ||
         rootId !== messageId ||
@@ -1247,6 +1366,7 @@ export function createThreadView({
         replies: replies.filter((row) => !row.delivery),
         direction,
         canLoadMore,
+        canAutoLoadMore,
         limited,
       });
     },

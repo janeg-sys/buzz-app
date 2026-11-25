@@ -155,10 +155,11 @@ function ResolvedReview({
     view?.snapshot ?? noThreadSnapshot,
     view?.snapshot ?? noThreadSnapshot,
   );
+  const canAutoLoadMore = snapshot?.canAutoLoadMore ?? snapshot?.canLoadMore;
   useEffect(() => {
-    if (snapshot?.status === "ready" && snapshot.canLoadMore)
-      void view?.loadMore();
-  }, [view, snapshot?.status, snapshot?.canLoadMore]);
+    if (snapshot?.status === "ready" && canAutoLoadMore)
+      void view?.loadMore({ automatic: true });
+  }, [view, snapshot?.status, canAutoLoadMore]);
   const knownRows = [
     snapshot?.root,
     snapshot?.target,
@@ -222,15 +223,14 @@ function ResolvedReview({
         retry={view.refresh}
       />
     );
+  const seen = new Set<string>();
   const replies = [snapshot.target, ...snapshot.replies]
-    .filter(
-      (row): row is NonNullable<typeof row> =>
-        !!row && row.id !== snapshot.root?.id,
-    )
-    .filter(
-      (row, index, rows) =>
-        rows.findIndex((item) => item.id === row.id) === index,
-    )
+    .filter((row): row is NonNullable<typeof row> => {
+      if (!row || row.id === snapshot.root?.id || seen.has(row.id))
+        return false;
+      seen.add(row.id);
+      return true;
+    })
     .sort(compareMessages);
   const threadRows = [snapshot.root, ...replies];
   return (
@@ -239,7 +239,7 @@ function ResolvedReview({
       rootId={snapshot.root.id}
       editMessages={threadRows}
       replies={replies}
-      limited={snapshot.limited}
+      limited={snapshot.limited || (snapshot.canLoadMore && !canAutoLoadMore)}
       timecodesSeekable={props.attachment.kind === "video"}
     />
   );

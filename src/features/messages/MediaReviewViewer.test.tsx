@@ -15,7 +15,11 @@ import userEvent from "@testing-library/user-event";
 import { PanelWorkspace } from "../panels/PanelWorkspace";
 import { afterEach, expect, it, vi } from "vitest";
 import { createRelaySession } from "../relay/session";
-import { keypair, message, profile, signed } from "../relay/testing";
+import { keypair, message, profile, roster, signed } from "../relay/testing";
+import { threadBinding } from "../relay/thread-window";
+import { connectBrokerTransport } from "../relay/transport";
+import type { ReadFilter, RelayEvent } from "../relay/events";
+import type { LiveCallbacks } from "../relay/live";
 import { MediaReviewViewer } from "./MediaReviewViewer";
 import { profileTarget } from "../profiles/target";
 
@@ -473,4 +477,114 @@ it("Escape closes media opened from a tab without closing the tab", async () => 
   expect(screen.getByRole("tab", { name: "One" })).toBeVisible();
   await user.keyboard("{Escape}");
   expect(closeTab).toHaveBeenCalledTimes(1);
+});
+
+it("stops eager loading at the automatic page limit on a strict thread and shows the history-limit notice", async () => {
+  const channel = "11111111-1111-4111-8111-111111111111";
+  const origin = "https://relay.example:8443";
+  const viewer = keypair(),
+    relay = keypair();
+  const attachment = {
+    url: "https://fixture.test/photo.png",
+    kind: "image" as const,
+  };
+  const root = message(viewer, channel, "Photo", 1, [
+    ["imeta", `url ${attachment.url}`, "m image/png"],
+  ]);
+  // 11 single-reply strict windows; eager loading stops at 10 while page 11 stays unread.
+  const replies = Array.from({ length: 11 }, (_, i) =>
+    message(viewer, channel, `Comment ${i + 1}`, 10 + i, [
+      ["e", root.id, "", "reply"],
+    ]),
+  );
+  const windowRequests: ReadFilter[] = [];
+  const fetcher = vi.fn(async (url: string, options?: RequestInit) => {
+    if (url.endsWith("/session"))
+      return Response.json({
+        viewer: viewer.pubkey,
+        relayAuthor: relay.pubkey,
+        relayUrl: origin,
+      });
+    const filters = JSON.parse(options?.body as string) as ReadFilter[];
+    const results: RelayEvent[] = [];
+    for (const filter of filters) {
+      if (filter.ids?.includes(root.id)) {
+        results.push(root);
+      } else if (filter.thread_window) {
+        windowRequests.push(filter);
+        const eligible = [...replies]
+          .sort(
+            (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),
+          )
+          .filter(
+            (e) =>
+              filter.until === undefined ||
+              e.created_at < filter.until ||
+              (e.created_at === filter.until &&
+                e.id > (filter.before_id ?? "")),
+          );
+        const page = eligible.slice(0, 1);
+        const last = page.at(-1);
+        const cursor =
+          last && eligible.length > page.length
+            ? { created_at: last.created_at, id: last.id }
+            : null;
+        const binding = await threadBinding(filter, origin, viewer.pubkey);
+        results.push(
+          ...page,
+          signed(relay, {
+            kind: 39007,
+            tags: [
+              ["d", binding],
+              ["h", channel],
+              ["e", root.id],
+            ],
+            content: JSON.stringify({
+              version: 1,
+              direction: "older",
+              has_more: cursor !== null,
+              next_cursor: cursor,
+            }),
+          }),
+        );
+      }
+    }
+    return Response.json(results);
+  });
+  vi.stubGlobal("fetch", fetcher);
+  try {
+    const transport = await connectBrokerTransport();
+    let traffic!: LiveCallbacks;
+    const owner = createRelaySession({
+      ...transport,
+      media: (url) => url,
+      subscribe(callbacks) {
+        traffic = callbacks;
+        return { update() {}, retry() {}, dispose() {} };
+      },
+    });
+    owners.push(owner);
+    traffic.receive([root, roster(relay, channel, [viewer.pubkey])]);
+    render(
+      <MediaReviewViewer
+        attachment={attachment}
+        session={owner.session}
+        scope="strict-limit"
+        channelId={channel}
+        channelName="Strict"
+        messageId={root.id}
+        initialTime={0}
+        onOpenLink={() => false}
+        close={() => {}}
+      />,
+    );
+    expect(
+      await screen.findByText("Thread history limit reached."),
+    ).toBeVisible();
+    expect(windowRequests).toHaveLength(10);
+    expect(screen.getByText("Comment 11")).toBeVisible();
+    expect(screen.queryByText("Comment 1")).toBeNull();
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });
