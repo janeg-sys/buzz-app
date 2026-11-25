@@ -1,7 +1,6 @@
 import { openChannelDetails } from "./channel-details.mjs";
 import { readFile } from "node:fs/promises";
 import { test, expect } from "./fixture.mjs";
-import { openPage } from "./navigation.mjs";
 import { open } from "./timeline.mjs";
 
 test.use({
@@ -55,11 +54,11 @@ test("cold opening bypasses held DM labels; warm switching paints without a head
   // A visible pre-establishment head is not a warm, verified cache. A signed
   // missed message proves the catch-up reached the UI, not merely the broker.
   try {
-    // Open Alpha directly without open()'s 1s read-ahead poll: a 20-row
+    // Messages opens by default on launch; wait directly for Alpha without
+    // open()'s Search Buzz palette detour or 1s read-ahead poll (a 20-row
     // channel has no older history, and the held DM-label read shares the
-    // production 10s reader timeout across the cold/warm assertions below.
+    // production 10s reader timeout across the cold/warm assertions below).
     await page.goto(app.origin);
-    await openPage(page, "Messages");
     await page
       .getByRole("textbox", { name: "Message #Alpha", exact: true })
       .waitFor();

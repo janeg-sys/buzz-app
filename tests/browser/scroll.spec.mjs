@@ -352,7 +352,7 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
   app,
   browserName,
 }) => {
-  const ahead = await open(page, app);
+  const ahead = await open(page, app, { cold: true });
   await observeWork(page);
   let loaded = 20 + ahead.reduce((rows, read) => rows + read.events.length, 0);
   const cursors = new Set(
@@ -518,7 +518,7 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
   await history(page).hover();
   // Collect mounted IDs on every animation frame while wheeling upward in
   // <1,600px steps so adjacent mounted ranges overlap without paying a full
-  // settle() geometry-quiet wait on each of ~70 scan steps.
+  // settle() geometry-quiet wait or polling IPC on each of ~70 scan steps.
   const scanner = await history(page).evaluateHandle((element, selector) => {
     const ids = new Set();
     let wheels = 0;
@@ -559,7 +559,13 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
         new Promise((resolve) =>
           requestAnimationFrame(() => {
             record();
-            resolve({ wheels, scrolled, ended, top: element.scrollTop });
+            resolve({
+              wheels,
+              scrolled,
+              ended,
+              scrollable: element.style.overflowY !== "hidden",
+              top: element.scrollTop,
+            });
           }),
         ),
       finish: () => {
@@ -591,10 +597,11 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
             const after = await readState();
             return (
               after.wheels > before.wheels &&
+              after.scrollable &&
               (after.top < 4 || (after.ended && after.scrolled))
             );
           },
-          { intervals: [16], message: "retained-history scan wheel advances" },
+          { intervals: [50], message: "retained-history scan wheel advances" },
         )
         .toBe(true);
     }
