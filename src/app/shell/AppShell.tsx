@@ -19,6 +19,7 @@ import {
   type Ref,
 } from "react";
 import { isApplePlatform } from "../../features/shortcuts/format";
+import { NEW_ID } from "./host-shortcut-ids";
 import { IconButton } from "../../shared/design-system/ui/IconButton";
 import { SidebarIcon } from "../../shared/design-system/icons";
 import { Panel } from "../../shared/design-system/ui/Panel";
@@ -230,7 +231,7 @@ function AppShellContent({
   useEffect(
     () =>
       searchServices?.shortcuts.registerHost({
-        id: "new",
+        id: NEW_ID,
         title: "Open New menu",
         binding: { key: "n", mod: true },
         order: 75,

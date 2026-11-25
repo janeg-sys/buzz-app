@@ -103,6 +103,21 @@ Keyboard focus is always visible. Shared components draw the ring, shown when
 behind. Shared text fields replace the ring with a border stroke. Don't add
 local focus rings.
 
+A field marked `data-field-selected` has focus but isn't being edited, as a
+keyboard plugin's normal mode leaves it. It shows the keyboard ring and no
+caret. Only such a plugin sets it.
+
+## Menus
+
+A shared `Menu` marks the element that had focus when it opened with
+`data-menu-origin` until it closes, so a row that opened a menu, such as a
+selected message, can keep its selected look.
+
+Menu letters are off until a caller turns them on with `enableMenuLetters`.
+While they're on, every item shows a key at its trailing edge that runs it.
+Keys come from the item's label; a `letter` prop fixes one. Don't add
+per-menu shortcut hints or key handlers.
+
 ## Identity shapes
 
 Humans are circles and agents are squircles: `Avatar shape="circle"` or
