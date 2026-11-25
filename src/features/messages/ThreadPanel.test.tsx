@@ -477,7 +477,7 @@ it("keeps initial rows pending until positioned, exposes errors, and lets readin
   h.render();
   expect(h.element.scrollTop).toBe(500);
 });
-it("starts a single older page after scrolling through 80% of loaded history", () => {
+it("starts a single older page after scrolling through 80% of loaded history, capped at 800px on tall threads", () => {
   const h = messagesHarness();
   h.snapshot.direction = "older";
   h.snapshot.canLoadMore = true;
@@ -493,6 +493,86 @@ it("starts a single older page after scrolling through 80% of loaded history", (
   h.render();
   h.scroll(0);
   expect(h.view.loadMore).toHaveBeenCalledOnce();
+
+  // Tall scroll ranges cap the trigger distance at 800px instead of 20%.
+  h.snapshot.status = "ready";
+  h.render();
+  h.resize(50_600); // scrollable range 50,000px; 20% would be 10,000px.
+  h.scroll(2000);
+  fireEvent.wheel(section, { deltaY: -1 });
+  h.scroll(801);
+  expect(h.view.loadMore).toHaveBeenCalledOnce();
+  h.scroll(800);
+  expect(h.view.loadMore).toHaveBeenCalledTimes(2);
+});
+it("counts live arrivals on Jump to latest for strict threads while older pages remain unloaded, after resumed rows settle", () => {
+  const h = messagesHarness();
+  const initial = {
+    ...row,
+    id: "reply-initial",
+    content: "initial reply",
+    createdAt: 10,
+    createdAtMs: 10_000,
+    threadRootId: row.id,
+    replyParentId: row.id,
+  };
+  h.snapshot.direction = "older";
+  h.snapshot.canLoadMore = true;
+  h.snapshot.resumed = true;
+  h.snapshot.replies = [initial];
+  const section = h.render();
+
+  // Scroll away from latest so Jump to latest is visible.
+  fireEvent.wheel(section, { deltaY: -1 });
+  h.scroll(1000);
+  expect(
+    within(section).getByRole("button", { name: "Jump to latest" }),
+  ).toBeVisible();
+
+  // Resumed rows do not establish an arrival baseline before the first refresh settles.
+  const whileResumed = {
+    ...initial,
+    id: "reply-while-resumed",
+    content: "arrived while resumed",
+    createdAt: 20,
+    createdAtMs: 20_000,
+  };
+  h.snapshot.replies = [initial, whileResumed];
+  h.render();
+  expect(
+    within(section).getByRole("button", { name: "Jump to latest" }),
+  ).toBeVisible();
+
+  // Once the non-resumed strict window settles, even with canLoadMore still
+  // true, subsequent live arrivals increment the new-message count.
+  h.snapshot.resumed = undefined;
+  h.render();
+  const liveArrival = {
+    ...initial,
+    id: "reply-live",
+    content: "live reply",
+    createdAt: 30,
+    createdAtMs: 30_000,
+  };
+  h.snapshot.replies = [initial, whileResumed, liveArrival];
+  h.render();
+  expect(
+    within(section).getByRole("button", { name: "1 new message" }),
+  ).toBeVisible();
+
+  // Prepending an older page does not count as a new arrival.
+  const olderReply = {
+    ...initial,
+    id: "reply-older",
+    content: "older reply",
+    createdAt: 5,
+    createdAtMs: 5_000,
+  };
+  h.snapshot.replies = [olderReply, initial, whileResumed, liveArrival];
+  h.render();
+  expect(
+    within(section).getByRole("button", { name: "1 new message" }),
+  ).toBeVisible();
 });
 it("keeps initial thread loading until available content has been positioned", () => {
   vi.useFakeTimers();
