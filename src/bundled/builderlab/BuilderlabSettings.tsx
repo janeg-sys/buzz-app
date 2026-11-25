@@ -64,6 +64,7 @@ export function BuilderlabSettings({
   initialSection,
   communities,
   agents,
+  connections,
   summaries,
   agentServer,
 }: {
@@ -74,6 +75,8 @@ export function BuilderlabSettings({
   initialSection?: Section | undefined;
   communities(navigation: ReactNode): ReactNode;
   agents: ReactNode;
+  /** Shown in full below the cards, where its status is seen on arrival. */
+  connections?: ReactNode;
   summaries?: Record<Section, OverviewSnapshot>;
   /** The sign-in server remote agents use, when it is not this account's. */
   agentServer?: string | undefined;
@@ -220,6 +223,7 @@ export function BuilderlabSettings({
             );
           })}
         </div>
+        {connections && <div className={styles.connections}>{connections}</div>}
       </div>
       {sections.map(({ id }) => (
         // Mount once on entry: the overview and section share the same reads.
