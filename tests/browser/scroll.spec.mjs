@@ -409,11 +409,6 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
     await expect
       .poll(() => history(page).evaluate((element) => element.scrollHeight))
       .toBeGreaterThan(height + Math.min(500, pending.events.length * 40));
-    await settle(page);
-    await expectAnchor(page, before);
-    expect(
-      await history(page).locator(rowSelector).count(),
-    ).toBeLessThanOrEqual(100);
     // Positive receipt: the page committed and its aux closure is read next.
     // Rows can sit outside the 1,600px virtual buffer while paging from the
     // prefetch zone.
@@ -429,6 +424,10 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
       )
       .toBe(true);
     await settle(page);
+    await expectAnchor(page, before);
+    expect(
+      await history(page).locator(rowSelector).count(),
+    ).toBeLessThanOrEqual(100);
     expect(app.pending.length).toBeLessThanOrEqual(1);
   }
   expect(loaded).toBe(historySize);
@@ -517,17 +516,94 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
     history(page).locator(`[data-message-id="${receipt.id}"]`),
   ).toBeInViewport();
   await history(page).hover();
-  const seen = new Set();
-  for (let step = 0; step < 200; step++) {
-    for (const id of await history(page)
-      .locator(rowSelector)
-      .evaluateAll((rows) => rows.map((row) => row.dataset.messageId)))
-      seen.add(id);
-    const top = await history(page).evaluate((element) => element.scrollTop);
-    if (top < 4) break;
-    // Less than the 1,600px buffer: adjacent mounted ranges overlap.
-    await page.mouse.wheel(0, -1400);
+  // Collect mounted IDs on every animation frame while wheeling upward in
+  // <1,600px steps so adjacent mounted ranges overlap without paying a full
+  // settle() geometry-quiet wait on each of ~70 scan steps.
+  const scanner = await history(page).evaluateHandle((element, selector) => {
+    const ids = new Set();
+    let wheels = 0;
+    let scrolled = false;
+    let ended = false;
+    let raf = 0;
+    const record = () => {
+      for (const row of element.querySelectorAll(selector)) {
+        const id = row.dataset.messageId;
+        if (id) ids.add(id);
+      }
+    };
+    const tick = () => {
+      record();
+      raf = requestAnimationFrame(tick);
+    };
+    const onWheel = () => {
+      wheels += 1;
+      scrolled = false;
+      ended = false;
+    };
+    const onScroll = (event) => {
+      if (event.target !== element) return;
+      scrolled = true;
+    };
+    const onScrollEnd = (event) => {
+      if (event.target !== element) return;
+      record();
+      ended = true;
+    };
+    record();
+    raf = requestAnimationFrame(tick);
+    element.addEventListener("wheel", onWheel, { passive: true });
+    element.addEventListener("scroll", onScroll, { passive: true });
+    element.addEventListener("scrollend", onScrollEnd, { passive: true });
+    return {
+      state: () =>
+        new Promise((resolve) =>
+          requestAnimationFrame(() => {
+            record();
+            resolve({ wheels, scrolled, ended, top: element.scrollTop });
+          }),
+        ),
+      finish: () => {
+        cancelAnimationFrame(raf);
+        element.removeEventListener("wheel", onWheel);
+        element.removeEventListener("scroll", onScroll);
+        element.removeEventListener("scrollend", onScrollEnd);
+        record();
+        return [...ids];
+      },
+    };
+  }, rowSelector);
+  let seen;
+  let pendingRead;
+  const readState = () => {
+    const read = scanner.evaluate((api) => api.state());
+    pendingRead = read;
+    return read;
+  };
+  try {
+    for (let step = 0; step < 200; step++) {
+      const before = await readState();
+      if (before.top < 4) break;
+      // Less than the 1,600px buffer: adjacent mounted ranges overlap.
+      await page.mouse.wheel(0, -1400);
+      await expect
+        .poll(
+          async () => {
+            const after = await readState();
+            return (
+              after.wheels > before.wheels &&
+              (after.top < 4 || (after.ended && after.scrolled))
+            );
+          },
+          { intervals: [16], message: "retained-history scan wheel advances" },
+        )
+        .toBe(true);
+    }
     await settle(page);
+    seen = new Set(await scanner.evaluate((api) => api.finish()));
+  } finally {
+    await pendingRead?.catch(() => {});
+    await scanner.evaluate((api) => api.finish()).catch(() => {});
+    await scanner.dispose();
   }
   await expect(
     history(page).locator(`[data-message-id="${first.id}"]`),

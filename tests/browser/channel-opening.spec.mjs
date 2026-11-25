@@ -1,6 +1,7 @@
 import { openChannelDetails } from "./channel-details.mjs";
 import { readFile } from "node:fs/promises";
 import { test, expect } from "./fixture.mjs";
+import { openPage } from "./navigation.mjs";
 import { open } from "./timeline.mjs";
 
 test.use({
@@ -54,7 +55,20 @@ test("cold opening bypasses held DM labels; warm switching paints without a head
   // A visible pre-establishment head is not a warm, verified cache. A signed
   // missed message proves the catch-up reached the UI, not merely the broker.
   try {
-    await open(page, app);
+    // Open Alpha directly without open()'s 1s read-ahead poll: a 20-row
+    // channel has no older history, and the held DM-label read shares the
+    // production 10s reader timeout across the cold/warm assertions below.
+    await page.goto(app.origin);
+    await openPage(page, "Messages");
+    await page
+      .getByRole("textbox", { name: "Message #Alpha", exact: true })
+      .waitFor();
+    await expect(
+      page
+        .getByRole("region", { name: "Channel message history" })
+        .locator("[data-message-id]")
+        .first(),
+    ).toBeVisible();
     expect(heads(app, "alpha")).toHaveLength(1);
     const missed = Object.fromEntries(
       ["alpha", "beta"].map((channel) => [
@@ -192,6 +206,11 @@ test("cold opening bypasses held DM labels; warm switching paints without a head
         });
     }
     expect(submittedHeads).toHaveLength(before);
+    // Verify the DM-label hold stayed pending and unaborted across cold open
+    // and all four warm switches before opening Diagnostics (~3s extra UI
+    // work can push elapsed hold time past the reader's 10s read timeout).
+    expect(app.report.profileHolds.some((held) => held.pending)).toBe(true);
+    expect(app.report.profileHolds.some((held) => held.aborted)).toBe(false);
     await openChannelDetails(page);
     const diagnostics = page
       .locator("summary")
@@ -210,8 +229,6 @@ test("cold opening bypasses held DM labels; warm switching paints without a head
     app.report.relayTimings = JSON.parse(
       await readFile(await timings.path(), "utf8"),
     );
-    expect(app.report.profileHolds.some((held) => held.pending)).toBe(true);
-    expect(app.report.profileHolds.some((held) => held.aborted)).toBe(false);
   } finally {
     preferences.resolve();
     app.relay.releaseEose("alpha");
