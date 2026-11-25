@@ -61,6 +61,7 @@ out. CI keeps the filmstrip.
 
 | Tag | Where it runs |
 | --- | --- |
+| `@macos-webkit` | WebKit's copy runs serially in the macOS CI job; Chromium still runs it in Linux `measurements`. |
 | `@local-only` | Locally only in both engines (the 50,000-record storage scale case). |
 | `@media-recorder` | WebKit's copy runs in the macOS CI job, because the Linux WebKit build has no media recorder. |
 | `@classic-scrollbars` | Only in the `chromium-classic-scrollbars` project. On a Mac, set `BUZZ_CLASSIC_SCROLLBARS=1` and turn on always-visible scroll bars, or these skip. |
@@ -79,8 +80,9 @@ plain `--repeat-each` doesn't repeat them.
 
 ## CI
 
-CI runs one serial measurement job, the functional journeys sharded across
-Linux runners per engine, and the `@media-recorder` WebKit cases on macOS.
+CI runs one serial Linux measurement job, the functional journeys sharded across
+Linux runners per engine, and the `@media-recorder` and `@macos-webkit` WebKit
+cases on macOS.
 Functional journeys use three workers on eight-core PR runners and two on
 standard runners. Measurements remain serial. To reproduce a denser functional
 run locally, use `BUZZ_BROWSER_WORKERS=3 bin/pnpm test:browser:ci --project chromium --no-deps`

@@ -1,20 +1,24 @@
 import { defineConfig } from "@playwright/test";
 import config from "./playwright.config.mjs";
 
-// Linux WebKit is built without MediaRecorder. Those cases run with the local
-// config in the required macOS job; Chromium still records on Linux.
+// Linux WebKit is built without MediaRecorder, and its wheel-scroll animation
+// floor makes the 640-row cursor-paging measurement too slow for Linux's 120s
+// timeout. Those WebKit cases run with the local config on the required macOS
+// job while Chromium keeps them on Linux.
 export default defineConfig({
   ...config,
   // Only the eight-core functional CI jobs opt into the extra worker.
   workers: Number(process.env.BUZZ_BROWSER_WORKERS || config.workers),
   projects: config.projects.map((project) =>
-    project.name === "webkit"
-      ? {
-          ...project,
-          grepInvert: /@classic-scrollbars|@media-recorder|@local-only/,
-        }
-      : project.name === "chromium"
-        ? { ...project, grepInvert: /@classic-scrollbars|@local-only/ }
-        : project,
+    project.name === "webkit-measurements"
+      ? { ...project, grepInvert: /@macos-webkit/ }
+      : project.name === "webkit"
+        ? {
+            ...project,
+            grepInvert: /@classic-scrollbars|@media-recorder|@local-only/,
+          }
+        : project.name === "chromium"
+          ? { ...project, grepInvert: /@classic-scrollbars|@local-only/ }
+          : project,
   ),
 });

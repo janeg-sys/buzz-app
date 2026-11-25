@@ -420,10 +420,11 @@ test("journeys tagged for special projects or platforms are never repeated", () 
     repeatableLines([
       { line: 10, tags: [] },
       { line: 20, tags: ["media-recorder"] },
-      { line: 30, tags: ["classic-scrollbars"] },
-      { line: 40, tags: ["other"] },
+      { line: 30, tags: ["macos-webkit"] },
+      { line: 40, tags: ["classic-scrollbars"] },
+      { line: 50, tags: ["other"] },
     ]),
-    [10, 40],
+    [10, 50],
   );
 });
 
@@ -984,7 +985,7 @@ test("related files merge into the edited selection: a line filter becomes the w
         // Two parameterized journeys share line 30.
         journey(30, "case 1"),
         journey(30, "case 2"),
-        journey(40, "mac only", ["media-recorder"]),
+        journey(40, "mac only", ["macos-webkit"]),
       ],
     ],
     [spec("b"), [journey(5, "b")]],
