@@ -61,14 +61,11 @@ out. CI keeps the filmstrip.
 
 | Tag | Where it runs |
 | --- | --- |
-| `@local-webkit` | Locally only in WebKit; Chromium still runs it in CI. Run these with `bin/pnpm test:browser:local-only`. |
 | `@local-only` | Locally only in both engines (the 50,000-record storage scale case). |
 | `@media-recorder` | WebKit's copy runs in the macOS CI job, because the Linux WebKit build has no media recorder. |
 | `@classic-scrollbars` | Only in the `chromium-classic-scrollbars` project. On a Mac, set `BUZZ_CLASSIC_SCROLLBARS=1` and turn on always-visible scroll bars, or these skip. |
 
 Don't add a tag to get a red test out of CI. Fix the product, fixture or test.
-Before removing `@local-webkit` from a case, check it passes repeatedly on Linux
-WebKit.
 
 ## Measurements
 

@@ -10,12 +10,21 @@ import {
   open,
   upper,
   edge,
+  toOlder,
+  virtuaIdle,
+  wheel,
 } from "./timeline.mjs";
 
 // Background communities connect after a random start delay, so their startup
 // reads can land in any window. Count only the community under test.
 const primaryQueries = (app) =>
   app.report.queries.filter(({ community }) => community === "primary").length;
+const primaryRowQueries = (app) =>
+  app.report.queries.filter(
+    ({ community, filter }) =>
+      community === "primary" &&
+      !(filter.include_aux && !filter.include_summaries),
+  ).length;
 
 test.use({ historyCounts: { alpha: 640, beta: 80 } });
 // Keep non-paging reading gestures outside the unchanged near-top read zone,
@@ -338,9 +347,11 @@ readingTest(
   },
 );
 
-test("cursor paging preserves visible anchors and keeps a large history virtualized", {
-  tag: "@local-webkit",
-}, async ({ page, app, browserName }) => {
+test("cursor paging preserves visible anchors and keeps a large history virtualized", async ({
+  page,
+  app,
+  browserName,
+}) => {
   const ahead = await open(page, app);
   await observeWork(page);
   let loaded = 20 + ahead.reduce((rows, read) => rows + read.events.length, 0);
@@ -352,15 +363,27 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
     // request the next page. A new gesture must not duplicate that pending read.
     expect(app.pending.length).toBeLessThanOrEqual(1);
     const alreadyPending = app.pending.length === 1;
-    const queriesBeforeWheel = primaryQueries(app);
-    await edge(page, -1);
+    const queriesBeforeWheel = primaryRowQueries(app);
+    if (alreadyPending) {
+      await history(page).hover();
+      const offset = await history(page).evaluate(
+        (element) => element.scrollTop,
+      );
+      if (offset >= 4) await wheel(page, -Math.min(400, offset));
+      else {
+        await page.mouse.wheel(0, -1);
+        await settle(page);
+      }
+    } else {
+      await toOlder(page, app, { top: false });
+    }
     await expect
       .poll(() => app.pending.length, {
         message: "wheel triggers production cursor read",
       })
       .toBe(1);
     expect(app.pending).toHaveLength(1);
-    if (alreadyPending) expect(primaryQueries(app)).toBe(queriesBeforeWheel);
+    if (alreadyPending) expect(primaryRowQueries(app)).toBe(queriesBeforeWheel);
     const before = await anchor(page);
     const height = await history(page).evaluate(
       (element) => element.scrollHeight,
@@ -385,17 +408,26 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
     loaded += pending.events.length;
     await expect
       .poll(() => history(page).evaluate((element) => element.scrollHeight))
-      .toBeGreaterThan(height + 500);
+      .toBeGreaterThan(height + Math.min(500, pending.events.length * 40));
     await settle(page);
     await expectAnchor(page, before);
     expect(
       await history(page).locator(rowSelector).count(),
     ).toBeLessThanOrEqual(100);
-    // Positive receipt: a returned older row is now mounted above our anchor.
-    // Home here would trigger the next page through a separate keyboard path.
-    await expect(
-      history(page).locator(`[data-message-id="${pending.events[0].id}"]`),
-    ).toBeAttached();
+    // Positive receipt: the page committed and its aux closure is read next.
+    // Rows can sit outside the 1,600px virtual buffer while paging from the
+    // prefetch zone.
+    await expect
+      .poll(() =>
+        app.report.queries.some(
+          ({ filter }) =>
+            filter.include_aux &&
+            !filter.include_summaries &&
+            filter.until === pending.filter.until &&
+            filter.before_id === pending.filter.before_id,
+        ),
+      )
+      .toBe(true);
     await settle(page);
     expect(app.pending.length).toBeLessThanOrEqual(1);
   }
@@ -415,6 +447,17 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
   await expect(
     history(page).locator(`[data-message-id="${first.id}"]`),
   ).toBeInViewport();
+  // Return to the tail through the app's own jump control before establishing
+  // an above-bottom reading anchor: Linux WebKit caps each wheel gesture near
+  // 1.5k px, so wheeling all 640 rows back down exceeds edge()'s gesture cap.
+  const latest = app.histories.get("primary/alpha").at(-1);
+  const jumpToLatest = page.getByRole("button", { name: "Jump to latest" });
+  await expect(jumpToLatest).toBeVisible();
+  await jumpToLatest.click();
+  await expect(
+    history(page).locator(`[data-message-id="${latest.id}"]`),
+  ).toBeInViewport();
+  await virtuaIdle(page);
   const saved = await upper(page);
   const savedOffset = await history(page).evaluate(
     (element) => element.scrollTop,
@@ -462,31 +505,32 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
   );
   const receipt = app.append("primary", "alpha");
   // The restored upper offset must still mean "do not follow". Receipt becomes
-  // positively visible at the end of the retained-history traversal below.
+  // positively visible at the start of the retained-history traversal below.
   await expect
     .poll(() => history(page).evaluate((element) => element.scrollHeight))
     .toBeGreaterThan(beforeAppendHeight);
   await settle(page);
   await expectAnchor(page, reading);
   const queriesBeforeTraversal = primaryQueries(app);
-  await edge(page, -1);
+  await end(page);
+  await expect(
+    history(page).locator(`[data-message-id="${receipt.id}"]`),
+  ).toBeInViewport();
+  await history(page).hover();
   const seen = new Set();
-  for (let step = 0; step < 100; step++) {
+  for (let step = 0; step < 200; step++) {
     for (const id of await history(page)
       .locator(rowSelector)
       .evaluateAll((rows) => rows.map((row) => row.dataset.messageId)))
       seen.add(id);
-    const gap = await history(page).evaluate(
-      (element) =>
-        element.scrollHeight - element.clientHeight - element.scrollTop,
-    );
-    if (gap < 4) break;
+    const top = await history(page).evaluate((element) => element.scrollTop);
+    if (top < 4) break;
     // Less than the 1,600px buffer: adjacent mounted ranges overlap.
-    await page.mouse.wheel(0, 1400);
+    await page.mouse.wheel(0, -1400);
     await settle(page);
   }
   await expect(
-    history(page).locator(`[data-message-id="${receipt.id}"]`),
+    history(page).locator(`[data-message-id="${first.id}"]`),
   ).toBeInViewport();
   for (const event of app.histories.get("primary/alpha"))
     expect(seen.has(event.id), `retained ${event.content.split("\n")[0]}`).toBe(
@@ -518,7 +562,6 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
 
 editTest(
   "live edits follow the bottom without stealing a reader's message anchor",
-  { tag: "@local-webkit" },
   async ({ page, app }) => {
     await open(page, app);
     await end(page);

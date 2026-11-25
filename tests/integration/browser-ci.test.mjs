@@ -179,6 +179,79 @@ test("Linux shards and macOS recording discover every CI functional test/project
   );
 });
 
+test("Linux measurements discover every Chromium and WebKit measurement test exactly once", () => {
+  const step = parse(workflow).jobs.measurements.steps.find(
+    (entry) => entry.name === "Serial Chromium and WebKit measurements",
+  );
+  assert.ok(step, "measurement step must exist");
+  assert.equal(step.if, undefined);
+  assert.equal(step["continue-on-error"], undefined);
+  const command = step.run.match(
+    /^\.\/bin\/node scripts\/ci-test-report\.mjs kind=playwright report=(\S+) evidence=\S+ title="[^"]+" -- (\.\/bin\/pnpm test:browser:ci .+)$/,
+  );
+  assert.ok(command, "measurement step must report through ci-test-report");
+  const [, report, invocation] = command;
+  assert.equal(step.env.PLAYWRIGHT_JSON_OUTPUT_FILE, report);
+  for (const name of ["chromium-measurements", "webkit-measurements"]) {
+    const local = config.projects.find((project) => project.name === name);
+    assert.ok(local, `${name} must exist in local config`);
+    assert.deepEqual(
+      ciConfig.projects.find((project) => project.name === name),
+      local,
+      `CI must run ${name} exactly as the local gate defines it`,
+    );
+  }
+  const discover = (args) => {
+    const listed = JSON.parse(
+      run("pnpm", ["--silent", ...args, "--list", "--reporter=json"]),
+    );
+    assert.deepEqual(listed.errors, []);
+    const collect = (suites) =>
+      suites.flatMap((suite) => [
+        ...(suite.specs ?? []).flatMap((spec) =>
+          spec.tests.map((entry) => {
+            assert.ok(
+              ["chromium-measurements", "webkit-measurements"].includes(
+                entry.projectName,
+              ),
+              "only measurement projects on the measurement step",
+            );
+            return `${entry.projectName}:${spec.id}`;
+          }),
+        ),
+        ...collect(suite.suites ?? []),
+      ]);
+    return collect(listed.suites);
+  };
+  const actual = discover(
+    invocation
+      .replace(/^\.\/bin\/pnpm /, "")
+      .split(/\s+/)
+      .map((arg) => arg.replace(/^'(.*)'$/, "$1")),
+  );
+  const expected = discover([
+    "test:browser",
+    "--project",
+    "chromium-measurements",
+    "--project",
+    "webkit-measurements",
+    "--no-deps",
+  ]);
+  assert.ok(actual.length > 0, "measurements must select tests");
+  assert.ok(actual.some((id) => id.startsWith("chromium-measurements:")));
+  assert.ok(actual.some((id) => id.startsWith("webkit-measurements:")));
+  assert.equal(
+    new Set(actual).size,
+    actual.length,
+    "no duplicate measurement test/project",
+  );
+  assert.deepEqual(
+    actual.sort(),
+    expected.sort(),
+    "Linux measurements must cover every Chromium and WebKit measurement test",
+  );
+});
+
 test("classic-scrollbar cases run exactly once, after the measurements, without clearing their evidence", () => {
   const { steps } = parse(workflow).jobs.measurements;
   const serial = steps.findIndex(
